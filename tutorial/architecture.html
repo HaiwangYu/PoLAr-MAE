@@ -1,0 +1,995 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PoLAr-MAE Architecture Walkthrough</title>
+<style>
+  :root {
+    --fg: #1f2328;
+    --muted: #57606a;
+    --line: #d0d7de;
+    --soft: #eaeef2;
+    --bg-code: #f6f8fa;
+    --blue: #0550ae;
+    --purple: #8250df;
+    --warn-bg: #fff8c5;
+    --warn-bar: #d4a72c;
+  }
+  html { scroll-behavior: smooth; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 1100px;
+    margin: 40px auto;
+    padding: 0 24px 80px;
+    color: var(--fg);
+    line-height: 1.55;
+  }
+  h1 { border-bottom: 1px solid var(--line); padding-bottom: .3em; }
+  h2 { border-bottom: 1px solid var(--soft); padding-bottom: .25em; margin-top: 2.2em; }
+  h3 { margin-top: 1.6em; }
+  h2, h3 { scroll-margin-top: 12px; }
+  h2 .anchor, h3 .anchor {
+    visibility: hidden;
+    margin-left: .35em;
+    color: var(--muted);
+    text-decoration: none;
+    font-weight: normal;
+    font-size: .8em;
+  }
+  h2:hover .anchor, h3:hover .anchor { visibility: visible; }
+
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 92%;
+  }
+  pre {
+    background: var(--bg-code);
+    padding: 12px 14px;
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  code { background: var(--bg-code); padding: 1px 5px; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    margin: 14px 0;
+    width: 100%;
+    font-size: 95%;
+  }
+  th, td {
+    border: 1px solid var(--line);
+    padding: 6px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { background: var(--bg-code); }
+  .file { color: var(--blue); }
+  .shape { color: var(--purple); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .note {
+    background: var(--warn-bg);
+    border-left: 4px solid var(--warn-bar);
+    padding: 8px 12px;
+    border-radius: 4px;
+    margin: 12px 0;
+  }
+  .block-card {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 16px 0;
+    background: #fafbfc;
+  }
+  .arch-figure { text-align: center; margin: 8px 0 14px; }
+  img.arch { max-width: 640px; width: 100%; border: 1px solid var(--line); border-radius: 6px; }
+  .legend { font-size: 90%; color: var(--muted); }
+
+  /* Table of contents */
+  .toc {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #fafbfc;
+    padding: 14px 20px;
+    margin: 18px 0 28px;
+  }
+  .toc h2 { border: 0; margin: 0 0 8px; padding: 0; font-size: 1.05em; }
+  .toc ol { margin: 0; padding-left: 22px; }
+  .toc ol ol { padding-left: 18px; margin: 2px 0; }
+  .toc li { margin: 3px 0; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>PoLAr-MAE — Architecture Walkthrough</h1>
+
+<p>
+This page maps every block of the PoLAr-MAE pretraining and fine‑tuning architecture
+to its implementation in the codebase, lists the input/output tensor shapes, and points
+out the hyperparameter defaults used by <code>configs/polarmae.yml</code> (ViT‑S/5‑voxel
+preset) and <code>configs/part_segmentation_polarmae_fft.yml</code>.
+</p>
+
+<div class="arch-figure">
+  <img class="arch" src="../images/arch.png" alt="PoLAr-MAE architecture diagram">
+  <div class="legend">
+    Architecture overview. Left: tokenization pipeline (Oversampled FPS → C‑NMS → Ball
+    Query + Masking → mini‑PointNet token embeddings). Center: ViT encoder–decoder with
+    two reconstruction heads (Linear&nbsp;1 → full patch, Linear&nbsp;2 → per‑point
+    energy via the Equivariant mini‑PointNet branch). Right: the internal layouts of
+    mini‑PointNet and the order‑aware Equivariant mini‑PointNet.
+  </div>
+</div>
+
+<nav class="toc" aria-label="Table of contents">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#conventions">Dimensional conventions</a></li>
+    <li><a href="#fps">Oversampled FPS (Farthest Point Sampling)</a></li>
+    <li><a href="#cnms">C‑NMS (Centroid Non‑Maximum Suppression)</a></li>
+    <li><a href="#ballquery">Ball Query + Masking</a>
+      <ol>
+        <li><a href="#ballquery-bq">Ball query (patch construction)</a></li>
+        <li><a href="#ballquery-mask">MAE‑style masking</a></li>
+      </ol>
+    </li>
+    <li><a href="#minipointnet">mini‑PointNet (Patch Embedding)</a></li>
+    <li><a href="#equivariant">Equivariant mini‑PointNet</a></li>
+    <li><a href="#encoder">Encoder (Transformer Encoder)</a></li>
+    <li><a href="#decoder">Decoder (Transformer Decoder)</a></li>
+    <li><a href="#linear1">Linear&nbsp;1 — Full Patch Reconstruction Head</a></li>
+    <li><a href="#linear2">Linear&nbsp;2 — Per‑point Energy Reconstruction Head</a></li>
+    <li><a href="#pretrain-flow">Pretraining: end‑to‑end data flow</a></li>
+    <li><a href="#finetune">Fine‑tuning: semantic segmentation</a>
+      <ol>
+        <li><a href="#finetune-overview">Overview &amp; pipeline</a></li>
+        <li><a href="#finetune-tokenfeat">Token feature aggregation</a></li>
+        <li><a href="#finetune-upsample">Feature upsampling (PointNet++)</a></li>
+        <li><a href="#finetune-seghead">Segmentation head</a></li>
+        <li><a href="#finetune-loss">Loss &amp; data flow</a></li>
+      </ol>
+    </li>
+    <li><a href="#hparams">Hyperparameter cheatsheet</a></li>
+    <li><a href="#start">Where to start reading</a></li>
+  </ol>
+</nav>
+
+<h2 id="conventions">Dimensional conventions <a class="anchor" href="#conventions">¶</a></h2>
+<p>
+Throughout the codebase, tensor shapes follow these symbol conventions:
+</p>
+<table>
+  <tr><th>Symbol</th><th>Meaning</th><th>Default (ViT‑S/5)</th></tr>
+  <tr><td><code>B</code></td><td>Batch size</td><td>32</td></tr>
+  <tr><td><code>N</code></td><td>Points per event (variable, padded)</td><td>up to ≳10 k</td></tr>
+  <tr><td><code>C</code></td><td>Per‑point channels (x, y, z, energy)</td><td>4</td></tr>
+  <tr><td><code>G</code> / <code>T</code></td><td>Number of seed groups / final token (context) length</td><td><code>num_init_groups=256</code>, <code>context_length=512</code></td></tr>
+  <tr><td><code>K</code></td><td>Points per patch (after reduction)</td><td><code>group_max_points=32</code></td></tr>
+  <tr><td><code>K_big</code></td><td>Upscaled query size before per‑patch reduction</td><td><code>group_upscale_points=256</code></td></tr>
+  <tr><td><code>D</code></td><td>Token embedding dimension</td><td><code>embed_dim=384</code> (ViT‑S)</td></tr>
+  <tr><td><code>M</code></td><td>Number of masked tokens per batch (≈ 0.6·T per event)</td><td>—</td></tr>
+</table>
+
+<h2 id="fps">1. Oversampled FPS (Farthest Point Sampling) <a class="anchor" href="#fps">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Pick a large set of candidate centers that uniformly covers the event.
+PoLAr‑MAE intentionally <em>oversamples</em> (more seeds than the final number of patches)
+so that C‑NMS can later thin them out while keeping coverage.</p>
+
+<p><b>Where implemented.</b></p>
+<ul>
+  <li>Function <code>sample_farthest_points()</code> — <span class="file">polarmae/layers/grouping.py:94-180</span>.
+      Wraps PyTorch3D's CUDA implementation (<code>_C.sample_farthest_points</code>, line&nbsp;178).</li>
+  <li>Called from <code>PointcloudGrouping.forward()</code> — <span class="file">polarmae/layers/grouping.py:345-350</span>:
+<pre><code>possible_centers, idx = sample_farthest_points(
+    points[..., :3].float(),
+    K=self.num_groups,
+    lengths=lengths,
+    random_start_point=True,
+)  # (B, G, 3)</code></pre>
+  </li>
+</ul>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>points[..., :3]</code></td><td><span class="shape">(B, N, 3)</span></td><td>XYZ of all event points</td></tr>
+  <tr><td>Input <code>lengths</code></td><td><span class="shape">(B,)</span></td><td>Number of valid points per event</td></tr>
+  <tr><td>Output <code>possible_centers</code></td><td><span class="shape">(B, G, 3)</span></td><td>FPS‑selected seed centers (<code>G = num_init_groups</code>)</td></tr>
+  <tr><td>Output <code>idx</code></td><td><span class="shape">(B, G)</span></td><td>Indices into the original cloud</td></tr>
+</table>
+
+<p><b>Algorithm.</b> Iterative greedy: at every step the next sample is the point with the
+largest distance to the already‑sampled set. <code>random_start_point=True</code> randomizes
+the first sample, so seed sets vary between training iterations.</p>
+
+<p><b>Default (ViT‑S/5).</b> <code>num_init_groups = 256</code> seeds — see
+<code>_5voxel_tokenizer()</code> in
+<span class="file">polarmae/layers/tokenizer.py:155-174</span>. The "oversampling" is relative
+to the eventual number of retained patches (≤ <code>context_length = 512</code> after C‑NMS).</p>
+</div>
+
+<h2 id="cnms">2. C‑NMS (Centroid Non‑Maximum Suppression) <a class="anchor" href="#cnms">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Greedy de‑duplication of FPS seeds. Patches whose ball neighbourhoods would
+overlap too much get suppressed; the retained centers approximate a voxelization of the
+pointcloud without aliasing.</p>
+
+<p><b>Where implemented.</b></p>
+<ul>
+  <li>Python wrapper <code>cnms()</code> —
+      <span class="file">extensions/cnms/cnms/__init__.py:11-75</span>.
+      Returns the suppressed centroid list, valid lengths, and a permutation index.</li>
+  <li>CUDA / CPU kernels for the greedy reduction — <span class="file">extensions/cnms/csrc/</span>
+      (<code>greedy_reduction_cuda.cu</code>, <code>greedy_reduction_cpu.cpp</code>).
+      Selects, in descending‑overlap‑count order, the seeds to keep and marks the rest
+      <code>retain=False</code>.</li>
+  <li>Driven from <code>PointcloudGrouping.forward()</code> —
+      <span class="file">polarmae/layers/grouping.py:357-374</span>:
+<pre><code>group_centers, lengths1, grouping_idx = cnms(
+    possible_centers,
+    overlap_factor=self.overlap_factor,   # 0.72 by default
+    radius=self.group_radius,
+    K=self.num_groups,
+    lengths=possible_lengths,
+)
+group_centers = group_centers[:, :self.context_length]
+lengths1      = lengths1.clamp_max(self.context_length)</code></pre>
+  </li>
+</ul>
+
+<p><b>Mechanism.</b></p>
+<ol>
+  <li>Run a self‑ball‑query on the FPS seeds with query radius
+      <code>2·radius·overlap_factor</code> (line&nbsp;48 of <code>__init__.py</code>).</li>
+  <li>For each seed, count how many other seeds fall inside its overlap radius
+      (<code>overlap_counts</code>, line&nbsp;60).</li>
+  <li>Sort seeds by overlap count (descending), then greedily keep a seed only if none of
+      its already‑kept neighbours overlap it. This is the <code>_ext.greedy_reduction</code>
+      kernel (line&nbsp;66).</li>
+  <li>Reorder so retained centers come first; truncate to <code>context_length</code>.</li>
+</ol>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th></tr>
+  <tr><td>Input <code>centroids</code></td><td><span class="shape">(B, G, 3)</span></td></tr>
+  <tr><td>Input <code>lengths</code></td><td><span class="shape">(B,)</span></td></tr>
+  <tr><td>Output <code>centroids</code> (reordered)</td><td><span class="shape">(B, G, 3)</span></td></tr>
+  <tr><td>Output <code>lengths</code> (retained per event)</td><td><span class="shape">(B,)</span></td></tr>
+</table>
+
+<p><b>Default (ViT‑S/5).</b> <code>overlap_factor=0.72</code>, <code>radius = 5/(768·√3/2)</code>,
+<code>context_length=512</code> — set in <code>_5voxel_tokenizer()</code>.</p>
+</div>
+
+<h2 id="ballquery">3. Ball Query + Masking <a class="anchor" href="#ballquery">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Two distinct operations combined visually in the diagram:</p>
+<ol>
+  <li><em>Ball Query (+ per‑patch reduction)</em>: build each patch by gathering points
+      around its center, then trim to a fixed point count <code>K</code>.</li>
+  <li><em>MAE masking</em>: randomly mark a fraction of the resulting tokens as "masked"
+      and hide them from the encoder.</li>
+</ol>
+
+<h3 id="ballquery-bq">3a. Ball query (patch construction) <a class="anchor" href="#ballquery-bq">¶</a></h3>
+<p><b>Where implemented.</b> Inside <code>PointcloudGrouping.forward()</code>,
+<span class="file">polarmae/layers/grouping.py:398-424</span> (PyTorch3D's
+<code>ball_query</code>) followed by an energy‑topk or FPS reduction.</p>
+<pre><code>_, idx, _ = ball_query(
+    group_centers[:, :, :3].float(),
+    points[:, :, :3].float(),
+    K=self.group_upscale_points,   # 256 = K_big
+    radius=self.group_radius,
+    lengths1=lengths1, lengths2=lengths,
+    return_nn=False,
+)  # idx: (B, T, K_big)
+
+# Per-patch reduction: K_big -> K
+if self.reduction_method == 'energy':
+    idx = select_topk_by_energy(points, idx, K=self.group_max_points, energies_idx=3)
+elif self.reduction_method == 'fps':
+    idx = select_topk_by_fps(points, idx, K=self.group_max_points)</code></pre>
+<p>Reduction helpers <code>select_topk_by_energy</code> (lines&nbsp;182‑233) and
+<code>select_topk_by_fps</code> (lines&nbsp;235‑265) live in the same file. The PoLAr‑MAE
+config uses <code>reduction_method='fps'</code>.</p>
+
+<p>Finally, patch coordinates are <em>centered</em> (subtract group center, line&nbsp;474)
+and rescaled by <code>group_radius</code> (line&nbsp;476‑479), matching PointNeXT.</p>
+
+<p><b>Tensor shapes (group construction).</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td><code>groups</code></td><td><span class="shape">(B, T, K, C)</span></td><td>Per‑patch points (C=4: xyz + energy)</td></tr>
+  <tr><td><code>group_centers</code></td><td><span class="shape">(B, T, 3)</span></td><td>Patch centers used for positional encoding</td></tr>
+  <tr><td><code>point_mask</code></td><td><span class="shape">(B, T, K)</span></td><td>True where the point slot is real (not padding)</td></tr>
+  <tr><td><code>embedding_mask</code></td><td><span class="shape">(B, T)</span></td><td>True where the patch itself is real (not padding)</td></tr>
+</table>
+
+<h3 id="ballquery-mask">3b. MAE‑style masking <a class="anchor" href="#ballquery-mask">¶</a></h3>
+<p><b>Where implemented.</b> <code>VariablePointcloudMasking._mask_center_rand</code> —
+<span class="file">polarmae/layers/masking.py:24-69</span>. It produces two boolean masks
+on the <em>token</em> axis. Wired up by the encoder:</p>
+<ul>
+  <li><span class="file">polarmae/layers/encoder.py:40-42</span> instantiates
+      <code>VariablePointcloudMasking(ratio=masking_ratio, type=masking_type)</code>.</li>
+  <li><span class="file">polarmae/layers/encoder.py:61-73</span>
+      (<code>prepare_tokens_with_masks</code>) calls it and stuffs <code>masked</code>,
+      <code>unmasked</code> into the output dict.</li>
+</ul>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>centers</code></td><td><span class="shape">(B, T, 3)</span></td><td>Patch centers (positions used for masking decisions)</td></tr>
+  <tr><td>Input <code>lengths</code></td><td><span class="shape">(B,)</span></td><td>Valid tokens per event</td></tr>
+  <tr><td>Output <code>masked</code></td><td><span class="shape">(B, T) — bool</span></td><td>Tokens hidden from the encoder</td></tr>
+  <tr><td>Output <code>unmasked</code></td><td><span class="shape">(B, T) — bool</span></td><td>Visible tokens passed to the encoder</td></tr>
+</table>
+
+<p><b>Default (ViT‑S/5).</b> <code>masking_ratio=0.6</code>, <code>masking_type='rand'</code>
+(<span class="file">configs/polarmae.yml:31-32</span>).</p>
+</div>
+
+<h2 id="minipointnet">4. mini‑PointNet (Patch Embedding) <a class="anchor" href="#minipointnet">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Turn each patch (a set of <code>K</code> points) into a single token
+embedding of dimension <code>D = embed_dim</code>. This is the "Patch Embedding" arrow into
+the encoder in the diagram.</p>
+
+<p><b>Where implemented.</b> Class <code>MaskedMiniPointNet</code> (with
+<code>equivariant=False</code>) —
+<span class="file">polarmae/layers/pointnet.py:9-74</span>.
+Instantiated inside the tokenizer at
+<span class="file">polarmae/layers/tokenizer.py:53</span>:</p>
+
+<pre><code>self.embedding = MaskedMiniPointNet(num_channels, token_dim)</code></pre>
+
+<p><b>Internal layout</b> (matches the right‑hand "mini‑PointNet" panel of the diagram):</p>
+<pre><code># pointnet.py:17-22 — first MLP (the "MLP" before "max")
+self.first_conv = nn.Sequential(
+    nn.Conv1d(channels, 128, 1, bias=False),       # 4 -> 128
+    MaskedBatchNorm1d(128),
+    nn.ReLU(inplace=True),
+    nn.Conv1d(128, 256, 1),                        # 128 -> 256
+)
+# pointnet.py:24-29 — second MLP (the "MLP" after "cat")
+self.second_conv = nn.Sequential(
+    nn.Conv1d(512, 512, 1, bias=False),            # 512 -> 512
+    MaskedBatchNorm1d(512),
+    nn.ReLU(inplace=True),
+    nn.Conv1d(512, feature_dim, 1),                # 512 -> D (=384 for ViT-S)
+)</code></pre>
+
+<p>The forward pass (lines&nbsp;35‑74) does:</p>
+<ol>
+  <li><b>Reshape</b> <span class="shape">(B, T, K, C)</span> → <span class="shape">(B·T, K, C)</span> if the input is per‑patch (line&nbsp;39‑43).</li>
+  <li><b>First MLP</b> (per‑point, with masked BN): <span class="shape">(B·T, C, K)</span> → <span class="shape">(B·T, 256, K)</span> (lines&nbsp;47‑51).</li>
+  <li><b>Max pool ("max")</b>: <span class="shape">(B·T, 256, K)</span> → <span class="shape">(B·T, 256, 1)</span> (line&nbsp;57).</li>
+  <li><b>Concat ("cat") of global + local</b>: <span class="shape">(B·T, 512, K)</span> (lines&nbsp;59‑61).</li>
+  <li><b>Second MLP</b>: <span class="shape">(B·T, 512, K)</span> → <span class="shape">(B·T, D, K)</span> (lines&nbsp;63‑67).</li>
+  <li><b>Final max</b> over points: <span class="shape">(B·T, D)</span>, then reshape back to <span class="shape">(B, T, D)</span> (lines&nbsp;70‑73).</li>
+</ol>
+
+<p><b>Padding handling.</b> <code>MaskedBatchNorm1d</code>
+(<span class="file">polarmae/layers/masking.py:205-297</span>) computes statistics only over
+valid points using <code>point_mask</code>. Patch padding is also zeroed out before the
+tokenizer (<span class="file">polarmae/layers/grouping.py:482</span>).</p>
+
+<p><b>Default channels (ViT‑S/5).</b> <code>num_channels=4</code> (xyz + energy),
+<code>token_dim = embed_dim = 384</code>.</p>
+</div>
+
+<h2 id="equivariant">5. Equivariant mini‑PointNet <a class="anchor" href="#equivariant">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> An order‑aware variant of mini‑PointNet used <em>only</em> on masked
+patches for the per‑point energy task. Adding a positional encoding over the point index
+breaks the permutation invariance of the standard PointNet so the decoder can attribute
+predicted energies back to specific points within the patch.</p>
+
+<p><b>Where implemented.</b> Same class <code>MaskedMiniPointNet</code> instantiated with
+<code>equivariant=True</code> —
+<span class="file">polarmae/layers/pointnet.py:9-74</span> — plus the
+<code>PointOrderEncoder</code> module —
+<span class="file">polarmae/layers/pointnet.py:96-110</span> — built on a sinusoidal
+<code>TimeEmbedding</code> (lines&nbsp;77‑94). The instance is created in the pretraining
+task: <span class="file">polarmae/models/ssl/polarmae.py:75-79</span>:</p>
+
+<pre><code>self.equivariant_patch_encoder = MaskedMiniPointNet(
+    channels=3,
+    feature_dim=self.embed_dim,
+    equivariant=True,
+)</code></pre>
+
+<p><b>Internal layout</b> (matches the right‑hand "Equivariant mini‑PointNet" panel):</p>
+<ul>
+  <li>Two parallel MLPs on the right diagram are the same <code>first_conv</code> applied
+      to the <em>points</em> and the order‑embedding produced by the
+      <code>PointOrderEncoder(256)</code>.</li>
+  <li>The two are summed (<span class="file">pointnet.py:54</span>):
+<pre><code>if self.equivariant:
+    feature = feature + self.position_encoder(points).transpose(2, 1)</code></pre></li>
+  <li>The remainder (max → cat → MLP → max) is identical to mini‑PointNet.</li>
+</ul>
+
+<p><b>PointOrderEncoder</b> takes the sequence <code>[0, 1, …, K-1]</code> (line&nbsp;107),
+runs it through a sinusoidal embedding of dimension 256, then a linear layer
+(lines&nbsp;99-103). Note this <em>indexes</em> per‑patch positions, not 3D coordinates —
+hence the "(0, 1, …, 31)" label in the diagram.</p>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>masked_groups[..., :3]</code></td><td><span class="shape">(M, K, 3)</span></td><td>XYZ of points in masked patches (M = total masked tokens in batch)</td></tr>
+  <tr><td>Input <code>masked_point_mask</code></td><td><span class="shape">(M, 1, K)</span></td><td>Valid point mask</td></tr>
+  <tr><td>Output</td><td><span class="shape">(M, D)</span></td><td>Patch embedding, D=384</td></tr>
+</table>
+</div>
+
+<h2 id="encoder">6. Encoder (Transformer Encoder) <a class="anchor" href="#encoder">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Standard ViT‑style self‑attention over the <em>visible</em> tokens only.
+The encoder learns rich contextual representations of the un‑masked patches.</p>
+
+<p><b>Where implemented.</b></p>
+<ul>
+  <li>Wrapper: <code>TransformerEncoder</code> —
+      <span class="file">polarmae/layers/encoder.py:14-139</span>. Bundles the tokenizer,
+      learned positional encoder, masking module, and the Transformer.</li>
+  <li>Transformer body: <code>Transformer</code> class —
+      <span class="file">polarmae/layers/transformer.py:30-146</span>; constructed via
+      <code>make_transformer(arch_name='vit_small')</code> →
+      <code>vit_small()</code> at <span class="file">transformer.py:187-197</span>.</li>
+  <li>Per‑block layer (norm → multi‑head attn → norm → MLP): <code>Block</code> in
+      <span class="file">polarmae/layers/block.py</span>; attention in
+      <span class="file">polarmae/layers/attention.py</span>.</li>
+  <li>Positional encoder: <code>LearnedPositionalEncoder</code> —
+      <span class="file">polarmae/layers/pos_embed.py:35-69</span>. A 3‑D MLP
+      (<code>Linear(3,128) → GELU → Linear(128, 384)</code>).</li>
+</ul>
+
+<p><b>Tensor shapes (forward).</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>x</code> (tokens)</td><td><span class="shape">(B, T, D)</span></td><td>Patch embeddings; masked positions hold mini‑PointNet output (later overwritten)</td></tr>
+  <tr><td>Input <code>pos_x</code></td><td><span class="shape">(B, T, D)</span></td><td>Learned position embedding of the patch centers</td></tr>
+  <tr><td>Input <code>x_mask</code> = <code>unmasked</code></td><td><span class="shape">(B, T) bool</span></td><td>Visible tokens (others are blocked in the attention mask)</td></tr>
+  <tr><td>Output <code>last_hidden_state</code></td><td><span class="shape">(B, T, D)</span></td><td>Encoded features (only visible positions are meaningful)</td></tr>
+</table>
+
+<p><b>Default (ViT‑S/5).</b> Inside <code>vit_small()</code>:
+<code>embed_dim=384, depth=12, num_heads=6, mlp_ratio=4</code>. PoLAr‑MAE overrides
+<code>postnorm=false</code>, <code>add_pos_at_every_layer=true</code>,
+<code>drop_path_rate=0.25</code>, <code>attn_drop_rate=0.05</code>,
+<code>use_flash_self_attn=true</code> —
+<span class="file">configs/polarmae.yml:36-42</span>.</p>
+</div>
+
+<h2 id="decoder">7. Decoder (Transformer Decoder) <a class="anchor" href="#decoder">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Inflate the encoder outputs (which carry information only at <em>visible</em>
+positions) plus learned <code>mask_token</code> embeddings into a sequence of features
+covering <em>all</em> token positions. The result is then fed to the two reconstruction
+heads.</p>
+
+<p><b>Where implemented.</b> Class <code>TransformerDecoder</code> —
+<span class="file">polarmae/layers/decoder.py:10-41</span>. It is just a thin wrapper around
+the same <code>Transformer</code> as the encoder, but with fewer layers and post‑norm.</p>
+
+<p><b>Wiring</b> (<span class="file">polarmae/models/ssl/polarmae.py:93-101</span>):</p>
+<pre><code># Encode visible tokens
+encoder_output = self.encoder.transformer(
+    out['x'], out['pos_embed'], unmasked
+).last_hidden_state                                   # (B, T, D)
+
+# Replace masked positions with a learned mask token
+corrupted_embeddings = (
+    encoder_output * unmasked.unsqueeze(-1)
+    + self.mask_token * masked.unsqueeze(-1)
+)                                                     # (B, T, D)
+
+# Decode over all positions
+decoder_output = self.decoder.transformer(
+    corrupted_embeddings, out['pos_embed'], out['emb_mask']
+).last_hidden_state                                   # (B, T, D)
+masked_output  = decoder_output[masked]                # (M, D)</code></pre>
+
+<p><b>Tensor shapes.</b> Input and output are <span class="shape">(B, T, D)</span>. After
+gathering masked positions for the reconstruction heads, the working shape becomes
+<span class="shape">(M, D)</span> where <code>M</code> is the total number of masked tokens
+in the batch.</p>
+
+<p><b>Default (ViT‑S/5).</b> Same <code>arch=vit_small</code> as encoder but with
+<code>depth=4</code>, <code>postnorm=true</code> —
+<span class="file">configs/polarmae.yml:43-54</span>.</p>
+</div>
+
+<h2 id="linear1">8. Linear 1 — Full Patch Reconstruction Head <a class="anchor" href="#linear1">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Predict the (x, y, z, energy) tuple for every point inside each masked
+patch. Loss: chamfer distance against the ground‑truth points.</p>
+
+<p><b>Where implemented.</b> Module <code>self.increase_dim</code> —
+<span class="file">polarmae/models/ssl/polarmae.py:59-63</span>:</p>
+<pre><code>self.increase_dim = nn.Conv1d(
+    encoder.embed_dim,                                  # 384
+    self.mae_channels * encoder.tokenizer.grouping.group_max_points,  # 4 * 32 = 128
+    1,
+)</code></pre>
+
+<p><b>Applied (and loss)</b> at
+<span class="file">polarmae/models/ssl/polarmae.py:104-115</span>:</p>
+<pre><code>upscaled = self.increase_dim(masked_output.transpose(0, 1)).transpose(0, 1)
+upscaled = upscaled.reshape(upscaled.shape[0], -1, self.mae_channels)  # (M, K, C')
+chamfer_loss, _ = chamfer_distance(
+    upscaled.float(),
+    masked_groups.float()[..., :self.mae_channels],
+    x_lengths=point_lengths, y_lengths=point_lengths,
+)</code></pre>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>masked_output</code></td><td><span class="shape">(M, D)</span></td><td>Decoder features at masked positions</td></tr>
+  <tr><td>Output <code>upscaled</code></td><td><span class="shape">(M, K, C')</span></td><td>Predicted points per masked patch; C' = 4 if <code>mae_prediction='full'</code>, 3 if <code>'pos'</code></td></tr>
+</table>
+
+<p><b>Defaults.</b> <code>mae_prediction='full'</code> →
+<code>mae_channels=4</code> (<span class="file">configs/polarmae.yml:55</span>);
+<code>K=group_max_points=32</code>.</p>
+</div>
+
+<h2 id="linear2">9. Linear 2 — Per‑point Energy Reconstruction Head <a class="anchor" href="#linear2">¶</a></h2>
+<div class="block-card">
+<p><b>Purpose.</b> Predict the scalar energy at every point of every masked patch.
+Loss: MSE versus ground‑truth energies.</p>
+
+<p><b>Where implemented.</b> Module <code>self.energy_decoder</code> —
+<span class="file">polarmae/models/ssl/polarmae.py:81-86</span>:</p>
+<pre><code>self.energy_decoder = nn.Conv1d(
+    2 * self.embed_dim,                                 # 768
+    1 * encoder.tokenizer.grouping.group_max_points,    # 32
+    1,
+)  # 2*embed_dim: one half encodes positions (equivariant), the other is the decoded mask token</code></pre>
+
+<p>The "cat" arrow in the diagram is this concatenation between the masked decoder output
+and the equivariant patch encoder output, performed at
+<span class="file">polarmae/models/ssl/polarmae.py:118-134</span>:</p>
+
+<pre><code>masked_point_mask = out['point_mask'][masked].unsqueeze(1)                   # (M, 1, K)
+equivariant_patch_encoder_output = self.equivariant_patch_encoder(           # (M, D)
+    masked_groups[..., :3], masked_point_mask
+)
+decoder_input = torch.cat(
+    [equivariant_patch_encoder_output, masked_output], dim=1                 # (M, 2D)
+)
+decoded_energy = self.energy_decoder(
+    decoder_input.transpose(0, 1)
+).transpose(0, 1)                                                            # (M, K)
+energy_loss = F.mse_loss(
+    decoded_energy[masked_point_mask.squeeze(1)],
+    masked_groups[masked_point_mask.squeeze(1)][..., -1],
+)</code></pre>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>decoder_input</code></td><td><span class="shape">(M, 2D)</span></td><td>Concatenated (equivariant patch encoding ⊕ masked decoder output)</td></tr>
+  <tr><td>Output <code>decoded_energy</code></td><td><span class="shape">(M, K)</span></td><td>One predicted energy per point per masked patch</td></tr>
+</table>
+
+<p><b>Defaults.</b> Loss weights from <span class="file">configs/polarmae.yml:21-24</span>:
+<code>chamfer=1.0, energy=1.0, ae=0.0</code>.</p>
+</div>
+
+<h2 id="pretrain-flow">Pretraining: end‑to‑end data flow (ViT‑S/5 defaults) <a class="anchor" href="#pretrain-flow">¶</a></h2>
+
+<table>
+<tr>
+  <th>#</th><th>Block</th><th>Input shape</th><th>Output shape</th><th>File / lines</th>
+</tr>
+<tr>
+  <td>0</td><td>Raw event</td><td>—</td><td><span class="shape">(B, N, 4)</span> + <span class="shape">lengths (B,)</span></td>
+  <td><span class="file">polarmae/datasets/PILArNet.py</span></td>
+</tr>
+<tr>
+  <td>1</td><td>Oversampled FPS</td>
+  <td><span class="shape">(B, N, 3)</span></td>
+  <td><span class="shape">(B, G=256, 3)</span></td>
+  <td><span class="file">grouping.py:94-180, 345-350</span></td>
+</tr>
+<tr>
+  <td>2</td><td>C‑NMS</td>
+  <td><span class="shape">(B, G, 3)</span></td>
+  <td><span class="shape">(B, T≤512, 3)</span></td>
+  <td><span class="file">extensions/cnms/cnms/__init__.py</span>; <span class="file">grouping.py:357-374</span></td>
+</tr>
+<tr>
+  <td>3a</td><td>Ball query + per‑patch FPS</td>
+  <td><span class="shape">(B, T, 3)</span>, full cloud</td>
+  <td><span class="shape">(B, T, K=32, 4)</span> patches + masks</td>
+  <td><span class="file">grouping.py:398-456</span></td>
+</tr>
+<tr>
+  <td>4</td><td>mini‑PointNet</td>
+  <td><span class="shape">(B, T, K, 4)</span></td>
+  <td><span class="shape">(B, T, D=384)</span> tokens</td>
+  <td><span class="file">pointnet.py:9-74</span></td>
+</tr>
+<tr>
+  <td>3b</td><td>MAE masking</td>
+  <td><span class="shape">(B, T, 3)</span></td>
+  <td><span class="shape">(B, T) bool</span> ×2 (masked, unmasked)</td>
+  <td><span class="file">masking.py:24-69</span></td>
+</tr>
+<tr>
+  <td>5</td><td>ViT‑S encoder (12 layers)</td>
+  <td><span class="shape">(B, T, D)</span></td>
+  <td><span class="shape">(B, T, D)</span></td>
+  <td><span class="file">encoder.py:14-139</span> + <span class="file">transformer.py</span></td>
+</tr>
+<tr>
+  <td>6</td><td>Mask‑token injection</td>
+  <td><span class="shape">(B, T, D)</span></td>
+  <td><span class="shape">(B, T, D)</span></td>
+  <td><span class="file">ssl/polarmae.py:96-99</span></td>
+</tr>
+<tr>
+  <td>7</td><td>ViT‑S decoder (4 layers)</td>
+  <td><span class="shape">(B, T, D)</span></td>
+  <td><span class="shape">(B, T, D)</span> → gather → <span class="shape">(M, D)</span></td>
+  <td><span class="file">decoder.py:10-41</span>; <span class="file">ssl/polarmae.py:100-101</span></td>
+</tr>
+<tr>
+  <td>8</td><td>Linear&nbsp;1 (patch head)</td>
+  <td><span class="shape">(M, D)</span></td>
+  <td><span class="shape">(M, K, 4)</span> + Chamfer loss</td>
+  <td><span class="file">ssl/polarmae.py:59-63, 104-115</span></td>
+</tr>
+<tr>
+  <td>9</td><td>Equivariant mini‑PointNet</td>
+  <td><span class="shape">(M, K, 3)</span></td>
+  <td><span class="shape">(M, D)</span></td>
+  <td><span class="file">pointnet.py:9-74, 96-110</span>; <span class="file">ssl/polarmae.py:75-79</span></td>
+</tr>
+<tr>
+  <td>10</td><td>cat + Linear&nbsp;2 (energy head)</td>
+  <td><span class="shape">(M, 2D)</span></td>
+  <td><span class="shape">(M, K)</span> + MSE loss</td>
+  <td><span class="file">ssl/polarmae.py:81-86, 118-134</span></td>
+</tr>
+</table>
+
+<h2 id="finetune">Fine‑tuning: semantic segmentation <a class="anchor" href="#finetune">¶</a></h2>
+
+<h3 id="finetune-overview">Overview &amp; pipeline <a class="anchor" href="#finetune-overview">¶</a></h3>
+<p>
+For downstream semantic segmentation, the pretrained encoder is reused as a feature
+extractor, the MAE masking and reconstruction heads are dropped, and three new components
+are added: a feature‑aggregation step, a PointNet++‑style upsampler that lifts token‑level
+features back to per‑point features, and a final segmentation head that produces class
+logits at every point.
+</p>
+
+<p><b>Top‑level Lightning module.</b> <code>SemanticSegmentation</code> —
+<span class="file">polarmae/models/finetune/semantic_segmentation.py:29-336</span>.
+Wired up by the task entrypoint
+<span class="file">polarmae/tasks/semantic_segmentation.py</span> and configured via
+<span class="file">configs/part_segmentation_polarmae_fft.yml</span> (full fine‑tuning) or
+<span class="file">configs/part_segmentation_polarmae_peft.yml</span> (linear probing).</p>
+
+<p>Constructor pieces (<span class="file">semantic_segmentation.py:65-86</span>):</p>
+<pre><code>self.encoder      = encoder         # same TransformerEncoder as pretraining
+self.seg_decoder  = seg_decoder     # default: None (no transformer decoder)
+self.upsampler    = PointNetFeatureUpsampling(in_channel=D, mlp=[D, D])
+self.seg_head     = SegmentationHead(
+    encoder_dim     = D if (seg_decoder is None and condition_global_features) else 0,
+    label_embedding_dim = 0,
+    upsampling_dim  = D,
+    seg_head_dim    = 512,
+    seg_head_dropout= 0.5,
+    num_seg_classes = num_classes,
+)</code></pre>
+
+<p>With the default config (<code>seg_decoder: null</code>,
+<code>condition_global_features: true</code>), the path through the network is:</p>
+
+<ol>
+  <li>Tokenize + encode the unmasked event with the pretrained encoder.</li>
+  <li>Aggregate encoder hidden states from layers <code>[3, 7, 11]</code>
+      (<a href="#finetune-tokenfeat">§ Token feature aggregation</a>).</li>
+  <li>Optionally append a global max‑pool + mean‑pool of the token features (the
+      "condition on global features" branch).</li>
+  <li>Use <code>PointNetFeatureUpsampling</code> to interpolate token features back to the
+      original points (<a href="#finetune-upsample">§ Feature upsampling</a>).</li>
+  <li>Pass the per‑point features through <code>SegmentationHead</code> for class logits
+      (<a href="#finetune-seghead">§ Segmentation head</a>).</li>
+</ol>
+
+<p><b>Masking is off during fine‑tuning.</b>
+<code>SemanticSegmentation.forward()</code>
+(<span class="file">semantic_segmentation.py:184-188</span>) calls
+<code>self.encoder.prepare_tokens(...)</code> — <em>not</em>
+<code>prepare_tokens_with_masks(...)</code> — so every patch is visible to the encoder.</p>
+
+<h3 id="finetune-tokenfeat">Token feature aggregation <a class="anchor" href="#finetune-tokenfeat">¶</a></h3>
+<div class="block-card">
+<p><b>Purpose.</b> Build a richer token‑level feature by mixing intermediate transformer
+layers, rather than using only the final layer.</p>
+
+<p><b>Where implemented.</b> Helper
+<code>TransformerEncoder.combine_intermediate_layers()</code> —
+<span class="file">polarmae/layers/encoder.py:111-121</span>. Invoked at
+<span class="file">polarmae/models/finetune/semantic_segmentation.py:198-203</span>:</p>
+
+<pre><code>token_features = self.encoder.combine_intermediate_layers(
+    output,
+    out['emb_mask'],
+    self.hparams.seg_head_fetch_layers,    # [3, 7, 11] by default
+)   # (B, T, D)</code></pre>
+
+<p>Each fetched layer's hidden state is first run through
+<code>masked_layer_norm()</code> (<span class="file">masking.py:119-143</span>), then the
+fetched layers are stacked and averaged.</p>
+
+<p><b>Global feature conditioning</b>
+(<span class="file">semantic_segmentation.py:205-213</span>, only active when
+<code>condition_global_features: true</code> and there is no
+<code>seg_decoder</code>):</p>
+<pre><code>token_features_max  = masked_max(token_features, out['emb_mask'])    # (B, D)
+token_features_mean = masked_mean(token_features, out['emb_mask'])   # (B, D)
+global_feature = torch.cat([token_features_max, token_features_mean], dim=-1)  # (B, 2D)</code></pre>
+<p>The 2D global vector is later broadcast over every original point and concatenated to
+the upsampled features
+(<span class="file">semantic_segmentation.py:229-234</span>).</p>
+
+<p><b>Default (full fine‑tuning).</b> <code>seg_head_fetch_layers: [3, 7, 11]</code>
+(<span class="file">configs/part_segmentation_polarmae_fft.yml:51</span>);
+<code>condition_global_features: true</code> (line 50). With
+<code>seg_decoder: null</code> (line 39), the segmentation runs directly on the aggregated
+encoder features.</p>
+</div>
+
+<h3 id="finetune-upsample">Feature upsampling (PointNet++‑style) <a class="anchor" href="#finetune-upsample">¶</a></h3>
+<div class="block-card">
+<p><b>Purpose.</b> Bring the <code>T</code> token‑level features back up to the original
+<code>N</code> points. Implementation follows PointNet++: inverse‑distance weighted KNN
+interpolation in 3D, optionally concatenated with per‑point xyz, then a small per‑point
+MLP.</p>
+
+<p><b>Where implemented.</b> Class <code>PointNetFeatureUpsampling</code> —
+<span class="file">polarmae/layers/feature_upsampling.py:11-94</span>. Instantiated at
+<span class="file">semantic_segmentation.py:74-77</span> with
+<code>in_channel=D, mlp=[D, D]</code>. Forward call at
+<span class="file">semantic_segmentation.py:219-227</span>:</p>
+
+<pre><code>x, idx = self.upsampler(
+    points[..., :3],            # xyz1: (B, N, 3) — original points
+    out['centers'][:, :, :3],   # xyz2: (B, T, 3) — patch centers
+    points[..., :3],            # points1: (B, N, 3)
+    token_features,             # points2: (B, T, D)
+    lengths,                    # valid points per event
+    batch_lengths,              # valid tokens per event
+    point_mask,                 # (B, N) bool
+)   # x: (B, N, D)</code></pre>
+
+<p><b>Mechanism</b>
+(<span class="file">feature_upsampling.py:29-93</span>):</p>
+<ol>
+  <li>For each original point in <code>xyz1</code>, find <code>K=5</code> nearest
+      patch‑center neighbours in <code>xyz2</code> via <code>knn_points</code>
+      (line&nbsp;49‑51).</li>
+  <li>Compute inverse‑distance weights, normalize so they sum to 1
+      (lines&nbsp;53‑56).</li>
+  <li>Gather token features at those neighbours and compute their weighted sum
+      (lines&nbsp;62‑66) → <span class="shape">(B, N, D)</span>.</li>
+  <li>Concatenate the original xyz (<code>points1</code>) onto the interpolated features
+      → <span class="shape">(B, N, D+3)</span> (lines&nbsp;72‑75).</li>
+  <li>Apply the MLP <code>[Conv1d(D+3 → D) → MaskedBN → ReLU] × 2</code>
+      (lines&nbsp;86‑90) → <span class="shape">(B, N, D)</span>.</li>
+</ol>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>xyz1</code></td><td><span class="shape">(B, N, 3)</span></td><td>Original points</td></tr>
+  <tr><td>Input <code>xyz2</code></td><td><span class="shape">(B, T, 3)</span></td><td>Patch centers</td></tr>
+  <tr><td>Input <code>points2</code></td><td><span class="shape">(B, T, D)</span></td><td>Per‑token features</td></tr>
+  <tr><td>Output</td><td><span class="shape">(B, N, D)</span></td><td>Per‑point features (D=384)</td></tr>
+</table>
+</div>
+
+<h3 id="finetune-seghead">Segmentation head <a class="anchor" href="#finetune-seghead">¶</a></h3>
+<div class="block-card">
+<p><b>Purpose.</b> A small 1×1‑convolutional classifier that turns per‑point features into
+class logits.</p>
+
+<p><b>Where implemented.</b> Class <code>SegmentationHead</code> —
+<span class="file">polarmae/layers/seg_head.py:7-62</span>.</p>
+
+<p><b>Internal layout</b> (<span class="file">seg_head.py:20-35</span>):</p>
+<pre><code>self.conv1 = Conv1d(2D + 0 + D, seg_head_dim, 1, bias=False)   # in = 3D when condition_global_features=true
+self.bn1   = MaskedBatchNorm1d(seg_head_dim)
+self.dropout1 = Dropout(seg_head_dropout)
+
+self.conv2 = Conv1d(seg_head_dim, seg_head_dim // 2, 1, bias=False)
+self.bn2   = MaskedBatchNorm1d(seg_head_dim // 2)
+
+self.conv3 = Conv1d(seg_head_dim // 2, num_seg_classes, 1)     # final classifier</code></pre>
+
+<p><b>Input channel breakdown</b>
+(<span class="file">seg_head.py:20-25</span> +
+<span class="file">semantic_segmentation.py:79-86, 229-234</span>):</p>
+<ul>
+  <li><code>upsampling_dim = D = 384</code> — per‑point features from the upsampler.</li>
+  <li><code>2 · encoder_dim = 2D = 768</code> — only when
+      <code>condition_global_features=true</code>: the broadcasted
+      [max‑pool, mean‑pool] global features.</li>
+  <li><code>label_embedding_dim = 0</code> — there is no event‑level class label embedding
+      for PoLAr‑MAE (placeholder for ShapeNet‑style part segmentation).</li>
+</ul>
+<p>So in the default config the conv1 input dimension is <code>3D = 1152</code>.</p>
+
+<p><b>Tensor shapes.</b></p>
+<table>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input</td><td><span class="shape">(B, 3D, N)</span></td><td>Channels‑first feature map</td></tr>
+  <tr><td>Intermediate</td><td><span class="shape">(B, 512, N)</span> → <span class="shape">(B, 256, N)</span></td><td>After conv1 / conv2</td></tr>
+  <tr><td>Output</td><td><span class="shape">(B, num_classes, N)</span></td><td>Logits (transposed back to <span class="shape">(B, N, num_classes)</span> in the model)</td></tr>
+</table>
+
+<p><b>Defaults (fft).</b> <code>seg_head_dim: 512</code>, <code>seg_head_dropout: 0.5</code>,
+<code>num_classes: 4</code>
+(<span class="file">configs/part_segmentation_polarmae_fft.yml:21,52-53</span>).</p>
+</div>
+
+<h3 id="finetune-loss">Loss &amp; data flow <a class="anchor" href="#finetune-loss">¶</a></h3>
+<div class="block-card">
+<p><b>Loss.</b> Choice between NLL or a Softmax Focal loss
+(<span class="file">semantic_segmentation.py:92-106</span>). The PoLAr‑MAE fft config uses
+<code>loss_func: focal</code> (<span class="file">configs/part_segmentation_polarmae_fft.yml:54</span>),
+implemented as <code>SoftmaxFocalLoss</code> in
+<span class="file">polarmae/loss/focal.py</span>. Per‑class weights come from the
+DataModule and are copied into the loss at setup
+(<span class="file">semantic_segmentation.py:154</span>).</p>
+
+<p>Loss application (<span class="file">semantic_segmentation.py:265-268</span>) gathers
+predictions and labels only at valid points:</p>
+<pre><code>loss = self.loss_func(
+    out['x'][out['point_mask']],
+    labels.squeeze(-1)[out['point_mask']],
+)</code></pre>
+
+<p>Validation reports <code>val_acc</code>, <code>val_macc</code>, <code>val_precision</code>,
+<code>val_mprecision</code>, <code>val_f1_score</code>, <code>val_f1_score_m</code>, plus
+instance and category mIoU via <code>compute_shape_ious</code>
+(<span class="file">polarmae/eval/segmentation.py</span>).</p>
+
+<p><b>End‑to‑end data flow (fft default, ViT‑S/5).</b></p>
+<table>
+<tr>
+  <th>#</th><th>Block</th><th>Input shape</th><th>Output shape</th><th>File / lines</th>
+</tr>
+<tr>
+  <td>0</td><td>Raw event + labels</td><td>—</td>
+  <td><span class="shape">(B, N, 4)</span>, <span class="shape">labels (B, N, 1)</span></td>
+  <td><span class="file">polarmae/datasets/PILArNet.py</span></td>
+</tr>
+<tr>
+  <td>1</td><td>Pretrained encoder (no masking)</td>
+  <td><span class="shape">(B, N, 4)</span></td>
+  <td><span class="shape">12 × (B, T≤512, 384)</span> hidden states</td>
+  <td><span class="file">encoder.py</span>; <span class="file">semantic_segmentation.py:184-190</span></td>
+</tr>
+<tr>
+  <td>2</td><td>Combine layers [3, 7, 11]</td>
+  <td><span class="shape">(B, T, 384) × 3</span></td>
+  <td><span class="shape">(B, T, 384)</span></td>
+  <td><span class="file">encoder.py:111-121</span></td>
+</tr>
+<tr>
+  <td>3</td><td>Global features (max ⊕ mean)</td>
+  <td><span class="shape">(B, T, 384)</span></td>
+  <td><span class="shape">(B, 768)</span></td>
+  <td><span class="file">semantic_segmentation.py:205-213</span></td>
+</tr>
+<tr>
+  <td>4</td><td>PointNet++ upsampling (K=5)</td>
+  <td>tokens <span class="shape">(B, T, 384)</span> + xyz <span class="shape">(B, N, 3)</span></td>
+  <td><span class="shape">(B, N, 384)</span></td>
+  <td><span class="file">feature_upsampling.py:11-94</span></td>
+</tr>
+<tr>
+  <td>5</td><td>Concat global features</td>
+  <td><span class="shape">(B, N, 384)</span> + <span class="shape">(B, 768)</span></td>
+  <td><span class="shape">(B, N, 1152)</span></td>
+  <td><span class="file">semantic_segmentation.py:229-234</span></td>
+</tr>
+<tr>
+  <td>6</td><td>Segmentation head</td>
+  <td><span class="shape">(B, 1152, N)</span></td>
+  <td><span class="shape">(B, num_classes=4, N)</span> logits</td>
+  <td><span class="file">seg_head.py:37-62</span></td>
+</tr>
+<tr>
+  <td>7</td><td>Focal loss / metrics</td>
+  <td>logits + labels (at valid points)</td>
+  <td>scalar loss + IoU/F1/accuracy</td>
+  <td><span class="file">semantic_segmentation.py:265-336</span></td>
+</tr>
+</table>
+</div>
+
+<div class="note">
+<b>PEFT (linear probing) variant.</b> The
+<span class="file">configs/part_segmentation_polarmae_peft.yml</span> config sets
+<code>encoder_freeze: true</code>; in that case
+<span class="file">semantic_segmentation.py:168-170</span> freezes the encoder parameters,
+so only the upsampler and segmentation head receive gradients. The forward pass is
+otherwise identical.
+</div>
+
+<h2 id="hparams">Hyperparameter cheatsheet <a class="anchor" href="#hparams">¶</a></h2>
+
+<h3>Pretraining — ViT‑S/5 (<code>configs/polarmae.yml</code>)</h3>
+<table>
+  <tr><th>Block / Parameter</th><th>Value</th><th>Source</th></tr>
+  <tr><td><code>num_init_groups</code> (oversampled FPS)</td><td>256</td><td><span class="file">tokenizer.py:160</span></td></tr>
+  <tr><td><code>context_length</code> (max retained patches)</td><td>512</td><td><span class="file">tokenizer.py:161</span></td></tr>
+  <tr><td><code>group_max_points</code> = K</td><td>32</td><td><span class="file">tokenizer.py:162</span></td></tr>
+  <tr><td><code>group_radius</code></td><td><code>5/(768·√3/2)</code></td><td><span class="file">tokenizer.py:163</span> (overridden by config)</td></tr>
+  <tr><td><code>group_upscale_points</code> = K_big</td><td>256</td><td><span class="file">tokenizer.py:164</span></td></tr>
+  <tr><td><code>overlap_factor</code> (C‑NMS)</td><td>0.72</td><td><span class="file">tokenizer.py:165</span></td></tr>
+  <tr><td><code>reduction_method</code></td><td>fps</td><td><span class="file">tokenizer.py:166</span></td></tr>
+  <tr><td><code>masking_ratio</code></td><td>0.6</td><td><span class="file">configs/polarmae.yml:31</span></td></tr>
+  <tr><td>Encoder depth / heads / D</td><td>12 / 6 / 384</td><td><span class="file">transformer.py:187-197</span></td></tr>
+  <tr><td>Decoder depth</td><td>4</td><td><span class="file">configs/polarmae.yml:49</span></td></tr>
+  <tr><td>Loss weights (chamfer / energy / ae)</td><td>1.0 / 1.0 / 0.0</td><td><span class="file">configs/polarmae.yml:21-24</span></td></tr>
+</table>
+
+<h3>Fine‑tuning — semantic segmentation (<code>configs/part_segmentation_polarmae_fft.yml</code>)</h3>
+<table>
+  <tr><th>Block / Parameter</th><th>Value</th><th>Source</th></tr>
+  <tr><td><code>num_classes</code></td><td>4</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:21</span></td></tr>
+  <tr><td><code>encoder_freeze</code> (fft / peft)</td><td>false / true</td><td>fft line 20 / peft line 20</td></tr>
+  <tr><td><code>seg_decoder</code></td><td>null</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:39</span></td></tr>
+  <tr><td><code>seg_head_fetch_layers</code></td><td>[3, 7, 11]</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:51</span></td></tr>
+  <tr><td><code>condition_global_features</code></td><td>true</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:50</span></td></tr>
+  <tr><td><code>seg_head_dim</code></td><td>512</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:52</span></td></tr>
+  <tr><td><code>seg_head_dropout</code></td><td>0.5</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:53</span></td></tr>
+  <tr><td><code>loss_func</code></td><td>focal</td><td><span class="file">configs/part_segmentation_polarmae_fft.yml:54</span></td></tr>
+  <tr><td>Upsampler K (kNN)</td><td>5</td><td><span class="file">feature_upsampling.py:12</span> (default)</td></tr>
+</table>
+
+<div class="note">
+  <b>Notation note.</b> The diagram labels the patch construction step as
+  "Ball query + Masking", but in the code these are two distinct operations:
+  <code>PointcloudGrouping</code> performs the ball query (and per‑patch reduction); a
+  separate <code>VariablePointcloudMasking</code> module produces the MAE mask over
+  <em>tokens</em>. Both happen inside <code>TransformerEncoder.prepare_tokens_with_masks()</code>.
+</div>
+
+<h2 id="start">Where to start reading <a class="anchor" href="#start">¶</a></h2>
+<ol>
+  <li><span class="file">polarmae/tasks/polarmae.py</span> /
+      <span class="file">polarmae/tasks/semantic_segmentation.py</span> — top‑level
+      Lightning entrypoints that wire the data module to the model.</li>
+  <li><span class="file">polarmae/models/ssl/polarmae.py</span> — the
+      <code>PoLArMAE.compute_loss()</code> method is a 60‑line tour of the whole pretraining
+      forward pass.</li>
+  <li><span class="file">polarmae/models/finetune/semantic_segmentation.py</span> — the
+      <code>SemanticSegmentation.forward()</code> method does the same for fine‑tuning.</li>
+  <li><span class="file">polarmae/layers/encoder.py</span> →
+      <span class="file">tokenizer.py</span> → <span class="file">grouping.py</span> +
+      <span class="file">masking.py</span> + <span class="file">pointnet.py</span> for the
+      tokenization pipeline.</li>
+  <li><span class="file">polarmae/layers/transformer.py</span> + <span class="file">block.py</span>
+      + <span class="file">attention.py</span> for the ViT body.</li>
+  <li><span class="file">polarmae/layers/feature_upsampling.py</span> +
+      <span class="file">seg_head.py</span> for the per‑point segmentation pipeline.</li>
+  <li><span class="file">extensions/cnms/</span> for the C‑NMS CUDA/CPU implementation.</li>
+</ol>
+
+</body>
+</html>
