@@ -163,57 +163,100 @@ Throughout the codebase, tensor shapes follow these symbol conventions:
   <tr><td><code>B</code></td><td>Batch size</td><td>32</td></tr>
   <tr><td><code>N</code></td><td>Points per event (variable, padded)</td><td>up to ≳10 k</td></tr>
   <tr><td><code>C</code></td><td>Per‑point channels (x, y, z, energy)</td><td>4</td></tr>
-  <tr><td><code>G</code> / <code>T</code></td><td>Number of seed groups / final token (context) length</td><td><code>num_init_groups=256</code>, <code>context_length=512</code></td></tr>
+  <tr><td><code>T</code></td><td>Number of patches/tokens kept after C‑NMS — <em>variable per event</em>, capped above by <code>context_length</code></td><td>≤ <code>context_length=512</code></td></tr>
   <tr><td><code>K</code></td><td>Points per patch (after reduction)</td><td><code>group_max_points=32</code></td></tr>
   <tr><td><code>K_big</code></td><td>Upscaled query size before per‑patch reduction</td><td><code>group_upscale_points=256</code></td></tr>
   <tr><td><code>D</code></td><td>Token embedding dimension</td><td><code>embed_dim=384</code> (ViT‑S)</td></tr>
   <tr><td><code>M</code></td><td>Number of masked tokens per batch (≈ 0.6·T per event)</td><td>—</td></tr>
 </table>
 
+<div class="note">
+  <b>About <code>num_init_groups</code> in the default config.</b> The diagram shows an
+  "Oversampled FPS" block that feeds C‑NMS, but the default ViT‑S/5 preset sets
+  <code>use_fps_seed=False</code> (<span class="file">polarmae/layers/tokenizer.py:167</span>),
+  which <em>bypasses FPS entirely</em> — all input points become candidate centers and
+  C‑NMS runs directly on them. In that mode <code>num_init_groups=256</code> is reused as
+  the <code>K</code> of the ball‑query <em>inside</em> C‑NMS (max overlap neighbours per
+  candidate); it is <strong>not</strong> a count of seeds or tokens. See §1 and §2 for
+  details. The "FPS → C‑NMS" pipeline drawn in the figure does apply to other presets
+  (e.g. the 25‑voxel tokenizer, <code>use_fps_seed=True</code>).
+</div>
+
 <h2 id="fps">1. Oversampled FPS (Farthest Point Sampling) <a class="anchor" href="#fps">¶</a></h2>
 <div class="block-card">
-<p><b>Purpose.</b> Pick a large set of candidate centers that uniformly covers the event.
-PoLAr‑MAE intentionally <em>oversamples</em> (more seeds than the final number of patches)
-so that C‑NMS can later thin them out while keeping coverage.</p>
+<p><b>Purpose.</b> Pick a large set of candidate centers that uniformly covers the event,
+so that C‑NMS can later thin them out while keeping coverage. <em>This block only runs
+when <code>use_fps_seed=True</code>.</em></p>
 
-<p><b>Where implemented.</b></p>
+<div class="note">
+<b>Bypassed in the default ViT‑S/5 config.</b> <code>_5voxel_tokenizer()</code> sets
+<code>use_fps_seed=False</code>
+(<span class="file">polarmae/layers/tokenizer.py:167</span>), so this block does
+<em>not</em> execute. In that case <code>PointcloudGrouping.forward()</code> takes the
+<code>else</code> branch
+(<span class="file">grouping.py:352-354</span>) and feeds the <strong>full input point
+cloud</strong> directly into C‑NMS as the candidate set:
+<pre><code>else: # using cnms
+    possible_centers = points[..., :3].float()
+    possible_lengths = lengths</code></pre>
+The 2.5‑voxel preset also has <code>use_fps_seed=False</code>; the 25‑voxel preset has
+<code>use_fps_seed=True</code> and does run this block.
+</div>
+
+<p><b>Switch logic</b>
+(<span class="file">grouping.py:327-329</span>):</p>
+<pre><code>self.use_fps_seed = self.overlap_factor is None or use_fps_seed
+if not self.use_fps_seed:
+    log.info("Using CNMS for grouping. Using `num_groups` as the K in the ball query "
+             f"({self.num_groups})! Make sure it's not too large!")</code></pre>
+
+<p><b>Where implemented (when active).</b></p>
 <ul>
   <li>Function <code>sample_farthest_points()</code> — <span class="file">polarmae/layers/grouping.py:94-180</span>.
       Wraps PyTorch3D's CUDA implementation (<code>_C.sample_farthest_points</code>, line&nbsp;178).</li>
-  <li>Called from <code>PointcloudGrouping.forward()</code> — <span class="file">polarmae/layers/grouping.py:345-350</span>:
-<pre><code>possible_centers, idx = sample_farthest_points(
-    points[..., :3].float(),
-    K=self.num_groups,
-    lengths=lengths,
-    random_start_point=True,
-)  # (B, G, 3)</code></pre>
+  <li>Called from <code>PointcloudGrouping.forward()</code> — <span class="file">polarmae/layers/grouping.py:344-351</span>:
+<pre><code>if self.use_fps_seed:
+    possible_centers, idx = sample_farthest_points(
+        points[..., :3].float(),
+        K=self.num_groups,
+        lengths=lengths,
+        random_start_point=True,
+    )  # (B, num_init_groups, 3)
+    possible_lengths = idx.ne(-1).sum(-1)</code></pre>
   </li>
 </ul>
 
-<p><b>Tensor shapes.</b></p>
+<p><b>Tensor shapes (when active).</b></p>
 <table>
   <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
   <tr><td>Input <code>points[..., :3]</code></td><td><span class="shape">(B, N, 3)</span></td><td>XYZ of all event points</td></tr>
   <tr><td>Input <code>lengths</code></td><td><span class="shape">(B,)</span></td><td>Number of valid points per event</td></tr>
-  <tr><td>Output <code>possible_centers</code></td><td><span class="shape">(B, G, 3)</span></td><td>FPS‑selected seed centers (<code>G = num_init_groups</code>)</td></tr>
-  <tr><td>Output <code>idx</code></td><td><span class="shape">(B, G)</span></td><td>Indices into the original cloud</td></tr>
+  <tr><td>Output <code>possible_centers</code></td><td><span class="shape">(B, num_init_groups, 3)</span></td><td>FPS‑selected seed centers</td></tr>
+  <tr><td>Output <code>idx</code></td><td><span class="shape">(B, num_init_groups)</span></td><td>Indices into the original cloud</td></tr>
 </table>
 
 <p><b>Algorithm.</b> Iterative greedy: at every step the next sample is the point with the
 largest distance to the already‑sampled set. <code>random_start_point=True</code> randomizes
 the first sample, so seed sets vary between training iterations.</p>
 
-<p><b>Default (ViT‑S/5).</b> <code>num_init_groups = 256</code> seeds — see
-<code>_5voxel_tokenizer()</code> in
-<span class="file">polarmae/layers/tokenizer.py:155-174</span>. The "oversampling" is relative
-to the eventual number of retained patches (≤ <code>context_length = 512</code> after C‑NMS).</p>
+<p><b>Default (ViT‑S/25, where this block runs).</b>
+<code>num_init_groups = 256</code>, <code>context_length = 128</code> —
+<span class="file">tokenizer.py:181-182</span>.</p>
 </div>
 
 <h2 id="cnms">2. C‑NMS (Centroid Non‑Maximum Suppression) <a class="anchor" href="#cnms">¶</a></h2>
 <div class="block-card">
-<p><b>Purpose.</b> Greedy de‑duplication of FPS seeds. Patches whose ball neighbourhoods would
-overlap too much get suppressed; the retained centers approximate a voxelization of the
-pointcloud without aliasing.</p>
+<p><b>Purpose.</b> Greedy de‑duplication of candidate centers. Candidates whose ball
+neighbourhoods would overlap too much get suppressed; the retained centers approximate a
+voxelization of the pointcloud without aliasing.</p>
+
+<p><b>Candidate set</b>
+(<span class="file">grouping.py:343-354</span>):</p>
+<ul>
+  <li>If <code>use_fps_seed=True</code>: candidates are the FPS seeds from §1.</li>
+  <li>If <code>use_fps_seed=False</code> (the default for ViT‑S/5 and ViT‑S/2.5): candidates
+      are <em>all</em> input points of the event.</li>
+</ul>
 
 <p><b>Where implemented.</b></p>
 <ul>
@@ -222,7 +265,7 @@ pointcloud without aliasing.</p>
       Returns the suppressed centroid list, valid lengths, and a permutation index.</li>
   <li>CUDA / CPU kernels for the greedy reduction — <span class="file">extensions/cnms/csrc/</span>
       (<code>greedy_reduction_cuda.cu</code>, <code>greedy_reduction_cpu.cpp</code>).
-      Selects, in descending‑overlap‑count order, the seeds to keep and marks the rest
+      Selects, in descending‑overlap‑count order, the candidates to keep and marks the rest
       <code>retain=False</code>.</li>
   <li>Driven from <code>PointcloudGrouping.forward()</code> —
       <span class="file">polarmae/layers/grouping.py:357-374</span>:
@@ -230,37 +273,66 @@ pointcloud without aliasing.</p>
     possible_centers,
     overlap_factor=self.overlap_factor,   # 0.72 by default
     radius=self.group_radius,
-    K=self.num_groups,
+    K=self.num_groups,                    # K of the ball-query INSIDE cnms (not a token count)
     lengths=possible_lengths,
 )
+# Post-cnms cap: truncate retained centers to context_length
 group_centers = group_centers[:, :self.context_length]
 lengths1      = lengths1.clamp_max(self.context_length)</code></pre>
   </li>
 </ul>
 
-<p><b>Mechanism.</b></p>
+<p><b>Mechanism</b> (<span class="file">extensions/cnms/cnms/__init__.py:48-75</span>):</p>
 <ol>
-  <li>Run a self‑ball‑query on the FPS seeds with query radius
-      <code>2·radius·overlap_factor</code> (line&nbsp;48 of <code>__init__.py</code>).</li>
-  <li>For each seed, count how many other seeds fall inside its overlap radius
+  <li>Run a self‑ball‑query on the candidates with query radius
+      <code>2·radius·overlap_factor</code> and a per‑candidate neighbour cap of
+      <code>K = num_init_groups</code> (line&nbsp;48‑58).
+      <em>This <code>K</code> bounds how many overlapping neighbours each candidate can
+      report — it does not bound the number of retained centers.</em></li>
+  <li>For each candidate, count how many other candidates fall inside its overlap radius
       (<code>overlap_counts</code>, line&nbsp;60).</li>
-  <li>Sort seeds by overlap count (descending), then greedily keep a seed only if none of
-      its already‑kept neighbours overlap it. This is the <code>_ext.greedy_reduction</code>
-      kernel (line&nbsp;66).</li>
+  <li>Sort candidates by overlap count (descending), then greedily keep a candidate only
+      if none of its already‑kept neighbours overlap it
+      (<code>_ext.greedy_reduction</code>, line&nbsp;66).</li>
   <li>Reorder so retained centers come first; truncate to <code>context_length</code>.</li>
 </ol>
 
+<p><b>How many tokens does C‑NMS produce?</b></p>
+<ul>
+  <li>The retained count <code>R</code> is <em>variable per event</em> — driven by event
+      geometry (sparse events keep many centers; dense/clumpy events keep fewer) plus
+      <code>radius</code> and <code>overlap_factor</code>.</li>
+  <li>C‑NMS itself does <strong>not</strong> target a specific number. There is no
+      "produce exactly 256" or "produce exactly 512" knob.</li>
+  <li><code>context_length</code> is applied <em>after</em> C‑NMS purely as an upper cap
+      (<span class="file">grouping.py:366-374</span>). If <code>R &gt; context_length</code>
+      for any event, the surplus is silently dropped and a one‑time warning is logged
+      (then <code>self.context_length</code> is bumped to <code>R.max()</code> so it
+      won't bite again on subsequent batches).</li>
+  <li>Final token count per event: <code>T = min(R, context_length)</code>.</li>
+</ul>
+
+<p><b>Role of <code>num_init_groups=256</code> in this branch.</b> Despite the name, it is
+<em>not</em> a count of tokens. It is the <code>K</code> of the ball‑query that C‑NMS uses
+internally to discover overlap neighbours. If a candidate has more than 256 neighbours
+within the overlap radius, only 256 are returned (and counted toward its sort key); the
+rest are still candidates but are simply not surfaced for <em>this</em> candidate's
+overlap test. Set too high → memory blowup; set too low → ranking is inaccurate. The log
+message at <span class="file">grouping.py:329</span> exists precisely to flag this.</p>
+
 <p><b>Tensor shapes.</b></p>
 <table>
-  <tr><th>Tensor</th><th>Shape</th></tr>
-  <tr><td>Input <code>centroids</code></td><td><span class="shape">(B, G, 3)</span></td></tr>
-  <tr><td>Input <code>lengths</code></td><td><span class="shape">(B,)</span></td></tr>
-  <tr><td>Output <code>centroids</code> (reordered)</td><td><span class="shape">(B, G, 3)</span></td></tr>
-  <tr><td>Output <code>lengths</code> (retained per event)</td><td><span class="shape">(B,)</span></td></tr>
+  <tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr>
+  <tr><td>Input <code>centroids</code></td><td><span class="shape">(B, P, 3)</span></td><td>Candidate centers (<code>P=N</code> when FPS is bypassed, else <code>P=num_init_groups</code>)</td></tr>
+  <tr><td>Input <code>lengths</code></td><td><span class="shape">(B,)</span></td><td>Valid candidates per event</td></tr>
+  <tr><td>Output <code>centroids</code> (reordered, retained first)</td><td><span class="shape">(B, P, 3)</span></td><td>Truncated to <code>(B, T, 3)</code> by the caller</td></tr>
+  <tr><td>Output <code>lengths</code></td><td><span class="shape">(B,)</span> = <code>R</code></td><td>Per‑event retained count, variable; clamped to <code>context_length</code> by the caller</td></tr>
 </table>
 
 <p><b>Default (ViT‑S/5).</b> <code>overlap_factor=0.72</code>, <code>radius = 5/(768·√3/2)</code>,
-<code>context_length=512</code> — set in <code>_5voxel_tokenizer()</code>.</p>
+<code>num_init_groups=256</code> (as ball‑query K), <code>context_length=512</code> (as
+upper cap) — set in <code>_5voxel_tokenizer()</code>. In practice on PILArNet, the C‑NMS
+output sits well below 512, so the cap rarely activates.</p>
 </div>
 
 <h2 id="ballquery">3. Ball Query + Masking <a class="anchor" href="#ballquery">¶</a></h2>
@@ -594,15 +666,15 @@ energy_loss = F.mse_loss(
   <td><span class="file">polarmae/datasets/PILArNet.py</span></td>
 </tr>
 <tr>
-  <td>1</td><td>Oversampled FPS</td>
-  <td><span class="shape">(B, N, 3)</span></td>
-  <td><span class="shape">(B, G=256, 3)</span></td>
-  <td><span class="file">grouping.py:94-180, 345-350</span></td>
+  <td>1</td><td>Oversampled FPS — <em>bypassed</em> in default config (<code>use_fps_seed=False</code>)</td>
+  <td>—</td>
+  <td>—</td>
+  <td><span class="file">grouping.py:344-354</span></td>
 </tr>
 <tr>
-  <td>2</td><td>C‑NMS</td>
-  <td><span class="shape">(B, G, 3)</span></td>
-  <td><span class="shape">(B, T≤512, 3)</span></td>
+  <td>2</td><td>C‑NMS (candidates = all input points)</td>
+  <td><span class="shape">(B, N, 3)</span></td>
+  <td><span class="shape">(B, T, 3)</span>, <code>T = min(R, 512)</code>, <code>R</code> variable per event</td>
   <td><span class="file">extensions/cnms/cnms/__init__.py</span>; <span class="file">grouping.py:357-374</span></td>
 </tr>
 <tr>
@@ -935,8 +1007,9 @@ otherwise identical.
 <h3>Pretraining — ViT‑S/5 (<code>configs/polarmae.yml</code>)</h3>
 <table>
   <tr><th>Block / Parameter</th><th>Value</th><th>Source</th></tr>
-  <tr><td><code>num_init_groups</code> (oversampled FPS)</td><td>256</td><td><span class="file">tokenizer.py:160</span></td></tr>
-  <tr><td><code>context_length</code> (max retained patches)</td><td>512</td><td><span class="file">tokenizer.py:161</span></td></tr>
+  <tr><td><code>use_fps_seed</code></td><td>false → FPS bypassed; cnms runs on all points</td><td><span class="file">tokenizer.py:167</span></td></tr>
+  <tr><td><code>num_init_groups</code> (= K of ball‑query inside C‑NMS, not a token count)</td><td>256</td><td><span class="file">tokenizer.py:160</span></td></tr>
+  <tr><td><code>context_length</code> (post‑C‑NMS upper cap on T)</td><td>512</td><td><span class="file">tokenizer.py:161</span></td></tr>
   <tr><td><code>group_max_points</code> = K</td><td>32</td><td><span class="file">tokenizer.py:162</span></td></tr>
   <tr><td><code>group_radius</code></td><td><code>5/(768·√3/2)</code></td><td><span class="file">tokenizer.py:163</span> (overridden by config)</td></tr>
   <tr><td><code>group_upscale_points</code> = K_big</td><td>256</td><td><span class="file">tokenizer.py:164</span></td></tr>
