@@ -1,0 +1,32 @@
+                                  Encoder
+                            ┌──────────────────┐
+   tokens (B,T,D) ───────►  │  Block 0 ─► h₀   │
+   pos_embed ─────────────► │  Block 1 ─► h₁   │
+   emb_mask ──────────────► │  Block 2 ─► h₂   │
+                            │  Block 3 ─► h₃ ──┼──┐
+                            │  ...             │  │  pick: [3, 7, 11]
+                            │  Block 7 ─► h₇ ──┼──┤
+                            │  ...             │  │
+                            │  Block 11 ─► h₁₁─┼──┤
+                            └──────────────────┘  │
+                                                  ▼
+                                  ┌──── combine_intermediate_layers ────┐
+                                  │  per layer:  masked_LayerNorm       │
+                                  │  stack + mean over picked layers    │
+                                  └─────────────────┬───────────────────┘
+                                                    │
+                                          token_features (B, T, D)
+                                                    │
+                          ┌─────────────────────────┴─────────────────────────┐
+                          │                                                   │
+                          ▼ (if condition_global_features)                    ▼ (always, per-point)
+              ┌──── masked_max  ──► (B, D) ─┐                       PointNetFeatureUpsampling
+              │    (per-channel,            │                                  │
+              │     ignoring padded T)      ├──► concat (B, 2D)                ▼
+              │                             │       │                    (B, N, D)
+              └──── masked_mean ──► (B, D) ─┘       │                          │
+                                                    │                          │
+                                                    └─► broadcast over N ──► concat (B, N, 3D)
+                                                                                │
+                                                                                ▼
+                                                                          SegHead → classes
