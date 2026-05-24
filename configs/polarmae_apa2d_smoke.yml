@@ -1,0 +1,143 @@
+# Smoke-test PoLAr-MAE config on DUNE APA wire-plane data (W view).
+#
+# Goal: confirm the APA2D adapter + transformation constants + probes end to
+# end on a tiny subset, in well under an hour on a single L40S.
+#
+# Data sources:
+#   - SSL pretraining (`data.*`):
+#       /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27
+#       1M-event production. No per-pixel PDG truth (frame_pid_1st absent).
+#   - SVM / SFT probes (`model.svm_validation.apa2d.*`):
+#       /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27
+#       100k-event production WITH frame_pid_1st truth used to derive
+#       3-class {track, shower, other} pixel labels.
+#
+# Smoke-test caps via dataset_kwargs.maxlen.
+
+seed_everything: 0
+
+trainer:
+  sync_batchnorm: false
+  gradient_clip_val: 3
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  max_steps: 800
+  precision: bf16-mixed
+  val_check_interval: 200
+  check_val_every_n_epoch: null
+  log_every_n_steps: 10
+  callbacks:
+    - class_path: polarmae.eval.probes.APA2DProbeCallback
+      init_args:
+        datamodule_key: larnet     # must match the dict key in model.svm_validation
+        max_pixels_per_class: 3000
+        svm_C: 1.0
+        sft_epochs: 20
+        sft_batch: 256
+        sft_lr: 5.0e-3
+        train_frac: 0.8
+        # json_dir is set at submit time via trainjob_polarmae.sh
+
+model:
+  loss_weights:
+    ae: 0.0
+    chamfer: 1.0
+    energy: 1.0
+  encoder:
+    class_path: polarmae.layers.encoder.TransformerEncoder
+    init_args:
+      num_channels: 4
+      arch: vit_small
+      voxel_size: 5                        # 5 (channel, tick) units = group radius in original coords
+      masking_ratio: 0.6
+      masking_type: rand
+      tokenizer_kwargs:
+        group_radius: ${eval:'${model.encoder.init_args.voxel_size} * ${model.transformation_scale_factor}'}
+      apply_relative_position_bias: false
+      transformer_kwargs:
+        postnorm: false
+        add_pos_at_every_layer: true
+        drop_rate: 0.0
+        attn_drop_rate: 0.05
+        drop_path_rate: 0.25
+        use_flash_self_attn: true          # uses torch SDPA, not flash-attn package
+  decoder:
+    class_path: polarmae.layers.decoder.TransformerDecoder
+    init_args:
+      arch: ${model.encoder.init_args.arch}
+      transformer_kwargs:
+        postnorm: true
+        depth: 4
+        add_pos_at_every_layer: ${model.encoder.init_args.transformer_kwargs.add_pos_at_every_layer}
+        drop_rate: ${model.encoder.init_args.transformer_kwargs.drop_rate}
+        attn_drop_rate: ${model.encoder.init_args.transformer_kwargs.attn_drop_rate}
+        drop_path_rate: ${model.encoder.init_args.transformer_kwargs.drop_path_rate}
+        use_flash_self_attn: ${model.encoder.init_args.transformer_kwargs.use_flash_self_attn}
+  mae_prediction: full
+
+  # LR scaled for BS=16 vs upstream BS=128: lr * sqrt(16/128) ~= 0.354.
+  learning_rate: 3.5e-5
+  optimizer_adamw_weight_decay: 0.05
+  lr_scheduler_linear_warmup_epochs: 100
+  lr_scheduler_linear_warmup_start_lr: 3e-6
+  lr_scheduler_cosine_eta_min: ${.lr_scheduler_linear_warmup_start_lr}
+  lr_scheduler_stepping: step
+  svm_validation_max_tokens: 4000
+  svm_validation_C: 0.005
+
+  train_transformations: [center_and_scale]   # no rotation: ch and tick are different physical axes
+  val_transformations:   [center_and_scale]
+
+  # W view: per-APA origin is (ch - 1600, tick), so coords live in
+  # ch ~ [0, 1049], tick ~ [0, 1125], z = 0.  Use a single uniform scale.
+  transformation_center: [525, 562, 0]
+  transformation_scale_factor: ${eval:'1.0 / 600.0'}
+  transformation_rotate_dims: null
+  transformation_rotate_degs: null
+
+  svm_validation:
+    # Key is 'larnet' to match upstream ModelCheckpoint(monitor='svm_val_acc_larnet').
+    larnet:
+      class_path: polarmae.datasets.APA2DDataModule
+      init_args:
+        # Use the truth dataset for probes (has frame_pid_1st).
+        data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/00[1-8]
+        val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/009
+        batch_size: 8
+        num_workers: 2
+        dataset_kwargs:
+          apa: 0
+          view: W
+          emin: 1.0
+          emax: 1.0e5
+          energy_threshold: 1.0
+          min_points: 256
+          maxlen: 600
+          return_semantic_id: true
+        test_dataset_kwargs:
+          maxlen: 200
+
+data:
+  class_path: polarmae.datasets.APA2DDataModule
+  init_args:
+    # SMOKE TEST: use the 100k-truth dataset for both SSL and probes.
+    # The 1M production has no per-pixel PDG; LightningCLI's Dict[str, LightningDataModule]
+    # parsing doesn't reliably honor svm_validation's own data_path, so we route both
+    # through this single datamodule. A follow-up will split SSL/probe data correctly.
+    data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/00[1-8]
+    val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/009
+    batch_size: 16
+    num_workers: 2
+    dataset_kwargs:
+      apa: 0
+      view: W
+      emin: 1.0
+      emax: 1.0e5
+      energy_threshold: 1.0
+      min_points: 256
+      maxlen: 2000
+      return_semantic_id: true               # labels live in the truth set; probes need them
+      return_cluster_id: false
+    test_dataset_kwargs:
+      maxlen: 400

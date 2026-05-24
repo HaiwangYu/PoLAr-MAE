@@ -1,0 +1,135 @@
+# Full PoLAr-MAE run on DUNE APA wire-plane data.
+#
+# SSL pretraining:  /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27
+#                   (no per-pixel labels — SSL doesn't need them)
+# Probes:           /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27
+#                   (per-pixel PDG truth, mapped to {track, shower, other} via
+#                    pdg_to_pixel_class)
+#
+# Probe data is wired through APA2DProbeCallback.probe_data_path so it is
+# independent of the upstream svm_validation Dict-of-DataModule plumbing
+# (which doesn't reliably honor independent init_args).
+
+seed_everything: 0
+
+trainer:
+  sync_batchnorm: false
+  gradient_clip_val: 3
+  devices: 1
+  num_nodes: 1
+  strategy: auto
+  max_steps: 20000                       # ~5-7 h on a single L40S at ~1.3 it/s
+  precision: bf16-mixed
+  val_check_interval: 1000               # probes ~5x cheaper than smoke
+  check_val_every_n_epoch: null
+  log_every_n_steps: 50
+  callbacks:
+    - class_path: polarmae.eval.probes.APA2DProbeCallback
+      init_args:
+        # Probe-owned datamodule (independent of svm_validation wiring).
+        probe_data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/00[1-8]
+        probe_val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-100k-truth-2026-02-27/13874/1/009
+        probe_batch_size: 8
+        probe_num_workers: 2
+        probe_dataset_kwargs:
+          apa: 0
+          view: W
+          emin: 1.0
+          emax: 1.0e5
+          energy_threshold: 1.0
+          min_points: 256
+          max_points: 8000
+          maxlen: -1
+          return_semantic_id: true
+        max_pixels_per_class: 5000
+        svm_C: 1.0
+        sft_epochs: 30
+        sft_batch: 256
+        sft_lr: 5.0e-3
+        train_frac: 0.8
+        # json_dir set at submit time
+
+model:
+  loss_weights:
+    ae: 0.0
+    chamfer: 1.0
+    energy: 1.0
+  encoder:
+    class_path: polarmae.layers.encoder.TransformerEncoder
+    init_args:
+      num_channels: 4
+      arch: vit_small
+      voxel_size: 5
+      masking_ratio: 0.6
+      masking_type: rand
+      tokenizer_kwargs:
+        group_radius: ${eval:'${model.encoder.init_args.voxel_size} * ${model.transformation_scale_factor}'}
+      apply_relative_position_bias: false
+      transformer_kwargs:
+        postnorm: false
+        add_pos_at_every_layer: true
+        drop_rate: 0.0
+        attn_drop_rate: 0.05
+        drop_path_rate: 0.25
+        use_flash_self_attn: true
+  decoder:
+    class_path: polarmae.layers.decoder.TransformerDecoder
+    init_args:
+      arch: ${model.encoder.init_args.arch}
+      transformer_kwargs:
+        postnorm: true
+        depth: 4
+        add_pos_at_every_layer: ${model.encoder.init_args.transformer_kwargs.add_pos_at_every_layer}
+        drop_rate: ${model.encoder.init_args.transformer_kwargs.drop_rate}
+        attn_drop_rate: ${model.encoder.init_args.transformer_kwargs.attn_drop_rate}
+        drop_path_rate: ${model.encoder.init_args.transformer_kwargs.drop_path_rate}
+        use_flash_self_attn: ${model.encoder.init_args.transformer_kwargs.use_flash_self_attn}
+  mae_prediction: full
+
+  # LR scaled for BS=16 vs upstream BS=128: lr * sqrt(16/128) ~= 0.354.
+  learning_rate: 3.5e-5
+  optimizer_adamw_weight_decay: 0.05
+  lr_scheduler_linear_warmup_epochs: 2000
+  lr_scheduler_linear_warmup_start_lr: 3e-6
+  lr_scheduler_cosine_eta_min: ${.lr_scheduler_linear_warmup_start_lr}
+  lr_scheduler_stepping: step
+  svm_validation_max_tokens: 7500
+  svm_validation_C: 0.005
+
+  train_transformations: [center_and_scale]
+  val_transformations:   [center_and_scale]
+
+  transformation_center: [525, 562, 0]
+  transformation_scale_factor: ${eval:'1.0 / 600.0'}
+  transformation_rotate_dims: null
+  transformation_rotate_degs: null
+
+  # Upstream's per-token SVM (SSLModel.validate) expects labeled data via
+  # `svm_validation`. LightningCLI's Dict[str, LightningDataModule] wiring is
+  # unreliable when init_args differ from `data:`. We bypass the whole thing:
+  # leave svm_validation empty (base.py loop becomes a no-op) and instead let
+  # APA2DProbeCallback own its labeled datamodule and log `svm_val_acc_larnet`
+  # itself so the upstream ModelCheckpoint(monitor='svm_val_acc_larnet') is happy.
+  svm_validation: {}
+
+data:
+  class_path: polarmae.datasets.APA2DDataModule
+  init_args:
+    # SSL pretraining on the unlabeled 1M-event production.
+    data_path:     /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27/13825/1/00[1-8]
+    val_data_path: /gpfs01/lbne/users/fm/cffm-data/prod-jay-1M-2026-02-27/13825/1/009
+    batch_size: 16
+    num_workers: 2
+    dataset_kwargs:
+      apa: 0
+      view: W
+      emin: 1.0
+      emax: 1.0e5
+      energy_threshold: 1.0
+      min_points: 256
+      max_points: 8000                   # prevent FPS-grouping overflow on dense events
+      maxlen: -1                         # full subset
+      return_semantic_id: false          # SSL doesn't need labels; 1M has none anyway
+      return_cluster_id: false
+    test_dataset_kwargs:
+      maxlen: 2000                       # cap val so the recon-loss val pass stays cheap

@@ -1,0 +1,19 @@
+# build_polarmae_env.sub — build PoLAr-MAE conda env at /gpfs01/lbne/users/fm/hyu/uvenv-polar-mae
+#
+# Submit from /direct/lbne+u/hyu/PoLAr-MAE/gridutils:
+#   condor_submit build_polarmae_env.sub
+universe                = vanilla
+executable              = /direct/lbne+u/hyu/PoLAr-MAE/gridutils/build_polarmae_env.sh
+output                  = /gpfs01/lbne/users/fm/hyu/CONDOR_OUT/build_polarmae_env.$(ClusterId).$(ProcId).out
+error                   = /gpfs01/lbne/users/fm/hyu/CONDOR_OUT/build_polarmae_env.$(ClusterId).$(ProcId).err
+log                     = /gpfs01/lbne/users/fm/hyu/CONDOR_OUT/build_polarmae_env.$(ClusterId).$(ProcId).log
+getenv                  = True
+request_memory          = 32000
+request_cpus            = 8
+request_gpus            = 1
+Requirements            = (GPUs_DeviceName == "NVIDIA L40S") && (GPUs_Capability == 8.9)
+should_transfer_files   = NO
+stream_output           = True
+stream_error            = True
+environment             = "MAX_JOBS=4"
+queue 1
