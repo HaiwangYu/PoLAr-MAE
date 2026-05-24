@@ -175,3 +175,5 @@ cython_debug/
 wandb/**
 .DS_Store
 *.swp
+.claude
+data
